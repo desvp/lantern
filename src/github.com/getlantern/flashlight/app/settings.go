@@ -1,12 +1,15 @@
 package app
 
 import (
-	"fmt"
+	"encoding/base64"
+	"encoding/json"
 	"io/ioutil"
 	"net/http"
 	"path/filepath"
-	"strconv"
+	"reflect"
 	"sync"
+
+	"code.google.com/p/go-uuid/uuid"
 
 	"github.com/getlantern/appdir"
 	"github.com/getlantern/launcher"
@@ -21,7 +24,6 @@ const (
 
 var (
 	service    *ui.Service
-	settings   *Settings
 	httpClient *http.Client
 	path       = filepath.Join(appdir.General("Lantern"), "settings.yaml")
 	once       = &sync.Once{}
@@ -30,7 +32,7 @@ var (
 // Settings is a struct of all settings unique to this particular Lantern instance.
 type Settings struct {
 	DeviceID  string `json:"deviceID,omitempty"`
-	UserID    int    `json:"userID,omitempty"`
+	UserID    int64  `json:"userID,omitempty"`
 	UserToken string `json:"userToken,omitempty"`
 
 	AutoReport  bool `json:"autoReport"`
@@ -45,12 +47,16 @@ type Settings struct {
 	sync.RWMutex `json:"-" yaml:"-"`
 }
 
-// loadSettings loads the initial settings at startup, either from disk or using defaults.
 func loadSettings(version, revisionDate, buildDate string) *Settings {
+	return loadSettingsFrom(version, revisionDate, buildDate, path)
+}
+
+// loadSettings loads the initial settings at startup, either from disk or using defaults.
+func loadSettingsFrom(version, revisionDate, buildDate, path string) *Settings {
 	log.Debug("Loading settings")
 	// Create default settings that may or may not be overridden from an existing file
 	// on disk.
-	settings = &Settings{
+	set := &Settings{
 		AutoReport:  true,
 		AutoLaunch:  true,
 		ProxyAll:    false,
@@ -60,33 +66,37 @@ func loadSettings(version, revisionDate, buildDate string) *Settings {
 	// Use settings from disk if they're available.
 	if bytes, err := ioutil.ReadFile(path); err != nil {
 		log.Debugf("Could not read file %v", err)
-	} else if err := yaml.Unmarshal(bytes, settings); err != nil {
+	} else if err := yaml.Unmarshal(bytes, set); err != nil {
 		log.Errorf("Could not load yaml %v", err)
 		// Just keep going with the original settings not from disk.
 	} else {
 		log.Debugf("Loaded settings from %v", path)
 	}
 
-	if settings.AutoLaunch {
-		launcher.CreateLaunchFile(settings.AutoLaunch)
+	// We always just set the device ID to the MAC address on the system. Note
+	// this ignores what's on disk, if anything.
+	set.DeviceID = base64.StdEncoding.EncodeToString(uuid.NodeID())
+
+	if set.AutoLaunch {
+		launcher.CreateLaunchFile(set.AutoLaunch)
 	}
 	// always override below 3 attributes as they are not meant to be persisted across versions
-	settings.Version = version
-	settings.BuildDate = buildDate
-	settings.RevisionDate = revisionDate
+	set.Version = version
+	set.BuildDate = buildDate
+	set.RevisionDate = revisionDate
 
 	// Only configure the UI once. This will typically be the case in the normal
 	// application flow, but tests might call Load twice, for example, which we
 	// want to allow.
 	once.Do(func() {
-		err := settings.start()
+		err := set.start()
 		if err != nil {
 			log.Errorf("Unable to register settings service: %q", err)
 			return
 		}
-		go settings.read()
+		go set.read(service.In, service.Out)
 	})
-	return settings
+	return set
 }
 
 // start the settings service that synchronizes Lantern's configuration with every UI client
@@ -100,13 +110,13 @@ func (s *Settings) start() error {
 		defer s.Unlock()
 		return write(s)
 	}
-	service, err = ui.Register(messageType, nil, helloFn)
+	service, err = ui.Register(messageType, helloFn)
 	return err
 }
 
-func (s *Settings) read() {
+func (s *Settings) read(in <-chan interface{}, out chan<- interface{}) {
 	log.Debugf("Reading settings messages!!")
-	for message := range service.In {
+	for message := range in {
 		log.Debugf("Read settings message!! %v", message)
 
 		// We're using a map here because we want to know when the user sends a
@@ -118,47 +128,48 @@ func (s *Settings) read() {
 			continue
 		}
 
-		var v, ok bool
+		s.checkBool(data, "autoReport", s.SetAutoReport)
+		s.checkBool(data, "proxyAll", s.SetProxyAll)
+		s.checkBool(data, "autoLaunch", s.SetAutoLaunch)
+		s.checkBool(data, "systemProxy", s.SetSystemProxy)
+		s.checkNum(data, "userID", s.SetUserID)
+		s.checkString(data, "userToken", s.SetToken)
 
-		if v, ok = data["autoReport"].(bool); ok {
-			s.SetAutoReport(v)
+		out <- s
+	}
+}
+
+func (s *Settings) checkBool(data map[string]interface{}, name string, f func(bool)) {
+	if v, ok := data[name].(bool); ok {
+		f(v)
+	} else {
+		log.Errorf("Could not convert %v in %v", name, data)
+	}
+}
+
+func (s *Settings) checkNum(data map[string]interface{}, name string, f func(int64)) {
+	if v, ok := data[name].(json.Number); ok {
+		if bigint, err := v.Int64(); err != nil {
+			log.Errorf("Could not get int64 value for %v with error %v", name, err)
+		} else {
+			f(bigint)
 		}
+	} else {
+		log.Errorf("Could not convert %v of type %v", name, reflect.TypeOf(data[name]))
+	}
+}
 
-		if v, ok = data["proxyAll"].(bool); ok {
-			s.SetProxyAll(v)
-		}
-
-		if v, ok = data["autoLaunch"].(bool); ok {
-			s.SetAutoLaunch(v)
-		}
-
-		if v, ok = data["systemProxy"].(bool); ok {
-			s.SetSystemProxy(v)
-		}
-
-		if data["userID"] != nil {
-			// This is unmarshaled into a float64, I'm am converting it to string and
-			// then to float32 to catch the case when this is a float32.
-			if id, err := strconv.Atoi(fmt.Sprintf("%v", data["userID"])); err == nil {
-				s.SetUserID(id)
-			}
-		}
-
-		if token, ok := data["token"].(string); ok {
-			s.SetToken(token)
-		}
-
-		if deviceID, ok := data["deviceID"].(string); ok {
-			s.SetDeviceID(deviceID)
-		}
-
-		service.Out <- s
+func (s *Settings) checkString(data map[string]interface{}, name string, f func(string)) {
+	if v, ok := data[name].(string); ok {
+		f(v)
+	} else {
+		log.Errorf("Could not convert %v in %v", name, data)
 	}
 }
 
 // Save saves settings to disk.
 func (s *Settings) save() {
-	log.Debug("Saving settings")
+	log.Trace("Saving settings")
 	s.Lock()
 	defer s.Unlock()
 	if bytes, err := yaml.Marshal(s); err != nil {
@@ -166,7 +177,7 @@ func (s *Settings) save() {
 	} else if err := ioutil.WriteFile(path, bytes, 0644); err != nil {
 		log.Errorf("Could not write settings file %v", err)
 	} else {
-		log.Debugf("Saved settings to %s with contents %v", path, string(bytes))
+		log.Tracef("Saved settings to %s with contents %v", path, string(bytes))
 	}
 }
 
@@ -217,9 +228,14 @@ func (s *Settings) GetSystemProxy() bool {
 
 // SetDeviceID sets the device ID
 func (s *Settings) SetDeviceID(deviceID string) {
-	s.Lock()
-	defer s.unlockAndSave()
-	s.DeviceID = deviceID
+	// Cannot set the device ID.
+}
+
+// GetDeviceID returns the unique ID of this device.
+func (s *Settings) GetDeviceID() string {
+	s.RLock()
+	defer s.RUnlock()
+	return s.DeviceID
 }
 
 // SetToken sets the user token
@@ -237,14 +253,14 @@ func (s *Settings) GetToken() string {
 }
 
 // SetUserID sets the user ID
-func (s *Settings) SetUserID(id int) {
+func (s *Settings) SetUserID(id int64) {
 	s.Lock()
 	defer s.unlockAndSave()
 	s.UserID = id
 }
 
 // GetUserID returns the user ID
-func (s *Settings) GetUserID() int {
+func (s *Settings) GetUserID() int64 {
 	s.RLock()
 	defer s.RUnlock()
 	return s.UserID

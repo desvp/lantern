@@ -22,10 +22,11 @@ import (
 )
 
 var (
-	isPacOn     = int32(0)
-	pacURL      string
-	directHosts = make(map[string]bool)
-	cfgMutex    sync.RWMutex
+	isPacOn       = int32(0)
+	pacURL        string
+	pacURLNoCache atomic.Value
+	directHosts   = make(map[string]bool)
+	cfgMutex      sync.RWMutex
 )
 
 func servePACFile() {
@@ -71,6 +72,8 @@ func setUpPacTool() error {
 }
 
 func genPACFile(w io.Writer) (int, error) {
+	// TODO: we don't need to generate this thing everytime.
+
 	hostsString := "[]"
 	// only bypass sites if proxy all option is unset
 	if !settings.GetProxyAll() {
@@ -161,6 +164,7 @@ func pacOff() {
 }
 
 func cyclePAC() {
+	log.Debug("Cycling the pac file")
 	// prevents Lantern from accidently leave pac on after exits
 	if atomic.LoadInt32(&isPacOn) == 1 {
 		// reapply so browser will fetch the PAC URL again
@@ -170,14 +174,45 @@ func cyclePAC() {
 }
 
 func doPACOn(pacURL string) {
-	err := pac.On(pacURL)
+	// Trying to bypass Windows' PAC file cache.
+	// This is a workaround for Windows 10 and Edge.
+	//
+	// Lantern changes the system's proxy settings a sets an URL like:
+	//
+	//   http://127.0.0.1:16823/proxy_on.pac
+	//
+	// This URL is verified by Windows, and if it works then the system sets it
+	// as system proxy.
+	//
+	// The problem here was that, after rebooting, this URL was checked before
+	// Lantern started, so it failed and was marked as invalid by the OS.
+	//
+	// After Lantern finally started and called pacOn() the URL was not being
+	// verified again, because it was the same URL the system tried to reach a
+	// few seconds before.
+	//
+	// Some browsers like Chrome or Firefox use the URL later in the game
+	// anyway when Lantern is running, but some others like Edge do not even
+	// try.
+	//
+	// By changing the URL here we are forcing the OS to check the URL whenever
+	// Lantern starts.
+	noCache := fmt.Sprintf("?%d", time.Now().UnixNano())
+	pacURLNoCache.Store(noCache)
+
+	err := pac.On(pacURL + noCache)
 	if err != nil {
 		log.Errorf("Unable to set lantern as system proxy: %v", err)
 	}
 }
 
 func doPACOff(pacURL string) {
-	err := pac.Off(pacURL)
+	var noCache string
+	_noCache := pacURLNoCache.Load()
+	if _noCache != nil {
+		noCache = _noCache.(string)
+	}
+	err := pac.Off(pacURL + noCache)
 	if err != nil {
 		log.Errorf("Unable to unset lantern as system proxy: %v", err)
 	}
